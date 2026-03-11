@@ -69,12 +69,25 @@ def download_apk(download_url, output_dir, version_code):
     tmp_filepath = filepath + ".downloading"
     print(f"下载: {download_url}", file=sys.stderr)
 
-    if shutil.which("axel"):
+    is_ci = os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")
+
+    if shutil.which("aria2c"):
+        aria2_args = [
+            "aria2c", "-x", "8", "-s", "8",
+            "--file-allocation=none",
+            "-d", os.path.dirname(tmp_filepath) or ".",
+            "-o", os.path.basename(tmp_filepath),
+        ]
+        if is_ci:
+            aria2_args += ["--summary-interval=0", "--console-log-level=warn"]
+        aria2_args.append(download_url)
+        subprocess.run(aria2_args, check=True)
+    elif shutil.which("axel"):
         axel_args = ["axel", "-n", "8", "-o", tmp_filepath]
-        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
-            axel_args.append("-q")  # CI 中静默，避免日志洪水
+        if is_ci:
+            axel_args.append("-q")
         else:
-            axel_args.append("-a")  # 本地显示进度条
+            axel_args.append("-a")
         axel_args.append(download_url)
         subprocess.run(axel_args, check=True)
     elif shutil.which("curl"):
