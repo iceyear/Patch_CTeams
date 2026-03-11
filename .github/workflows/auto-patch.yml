@@ -18,7 +18,7 @@ on:
           - all
         default: arm64-v8a
       skip_dialogs:
-        description: '跳过初始化弹窗'
+        description: '跳过初始化弹窗（Alpha）'
         type: boolean
         default: false
       fix_incoming_calls:
