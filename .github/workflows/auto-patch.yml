@@ -1,0 +1,158 @@
+name: Auto Patch Teams China
+
+on:
+  schedule:
+    # 每天 UTC 08:00 (北京时间 16:00) 检查
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: '强制重新构建 (忽略版本检查)'
+        type: boolean
+        default: false
+      arch:
+        description: '目标架构'
+        type: choice
+        options:
+          - arm64-v8a
+          - all
+        default: arm64-v8a
+      skip_dialogs:
+        description: '跳过初始化弹窗'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner axel
+          # Install apktool 3.0.1
+          APKTOOL_VERSION="3.0.1"
+          sudo wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -O /usr/local/bin/apktool.jar
+          sudo wget -q "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" -O /usr/local/bin/apktool
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Get last released version
+        id: last_version
+        run: |
+          # 从最新 release 的 tag 获取上次构建的 version_code
+          LAST_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
+          if [[ "$LAST_TAG" =~ ^v([0-9]+) ]]; then
+            echo "version_code=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+          else
+            echo "version_code=0" >> $GITHUB_OUTPUT
+          fi
+          echo "Last version_code: ${BASH_REMATCH[1]:-0}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check latest version
+        id: check
+        run: |
+          python3 check_and_download.py --check --json > /tmp/version.json
+          cat /tmp/version.json | python3 -m json.tool
+
+          VERSION_CODE=$(python3 -c "import json; d=json.load(open('/tmp/version.json')); print(d['version_code'])")
+          VERSION_NAME=$(python3 -c "import json; d=json.load(open('/tmp/version.json')); print(d['version_name'])")
+
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+
+          LAST=${{ steps.last_version.outputs.version_code }}
+          if [ "${{ inputs.force_rebuild }}" = "true" ] || [ "$VERSION_CODE" -gt "${LAST:-0}" ]; then
+            echo "is_new=true" >> $GITHUB_OUTPUT
+            echo "::notice::发现新版本: $VERSION_NAME (code: $VERSION_CODE)"
+          else
+            echo "is_new=false" >> $GITHUB_OUTPUT
+            echo "::notice::已是最新版本: $VERSION_NAME (code: $VERSION_CODE)"
+          fi
+
+      - name: Download APK
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          python3 check_and_download.py --download --output-dir . \
+            --min-version-code 0
+          ls -lh teams-china-*.apk
+
+      - name: Patch APK
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          INPUT_APK=$(ls teams-china-*.apk | head -1)
+          ARCH="${{ inputs.arch || 'arm64-v8a' }}"
+          SKIP_DIALOGS="${{ inputs.skip_dialogs }}"
+
+          PATCH_ARGS="$INPUT_APK"
+          if [ "$ARCH" != "all" ]; then
+            PATCH_ARGS="$PATCH_ARGS --arch $ARCH"
+          fi
+          if [ "$SKIP_DIALOGS" = "true" ]; then
+            PATCH_ARGS="$PATCH_ARGS --skip-dialogs"
+          fi
+
+          # 解码外部签名密钥库 (如果配置了 secrets)
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release-key.jks
+            export KEYSTORE_FILE=/tmp/release-key.jks
+          fi
+
+          export _JAVA_OPTIONS="-Xmx4g"
+          python3 patch_china_teams.py $PATCH_ARGS
+          ls -lh *-patched*.apk
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+
+      - name: Create Release
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          VERSION_CODE=${{ steps.check.outputs.version_code }}
+          VERSION_NAME="${{ steps.check.outputs.version_name }}"
+          ARCH="${{ inputs.arch || 'arm64-v8a' }}"
+          TAG="v${VERSION_CODE}"
+          PATCHED_APK=$(ls *-patched*.apk | head -1)
+          APK_SIZE=$(du -h "$PATCHED_APK" | cut -f1)
+
+          BODY="## Teams 国内版 — 个人账户 Patch
+
+          **版本**: ${VERSION_NAME} (code: ${VERSION_CODE})
+          **架构**: ${ARCH}
+          **大小**: ${APK_SIZE}
+          **来源**: Vivo 应用商店
+
+          ### Patch 内容
+          - ✅ 启用个人 (MSA/Consumer) 账户登录
+          - ✅ 修复 redirect URI (签名变更适配)
+          - ✅ 绕过 OneAuth redirect URI 校验
+          - 企业 (AAD) 账户不受影响
+          - 国内推送通道保持正常 (百度/小米/华为/OPPO/荣耀)
+
+          ### 注意事项
+          1. 签名已更改，需卸载原版后安装
+          2. 个人账户使用全球 Microsoft 登录服务
+          3. 自动构建，未经人工测试"
+
+          gh release create "$TAG" \
+            --title "Teams China v${VERSION_CODE} (Patched)" \
+            --notes "$BODY" \
+            "$PATCHED_APK"
+        env:
+          GH_TOKEN: ${{ github.token }}
