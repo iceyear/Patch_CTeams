@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       fix_incoming_calls:
-        description: '修复个人账户来电接收（测试）'
+        description: '修复个人账户来电接收（Alpha）'
         type: boolean
         default: false
 
@@ -152,7 +152,7 @@ jobs:
           - ✅ 启用个人 (MSA/Consumer) 账户登录
           - ✅ 修复 redirect URI (签名变更适配)
           - ✅ 绕过 OneAuth redirect URI 校验
-          - ✅ 修复个人账户来电接收 (启用 Premature Notification Flow)
+          - ⚠️ 目前个人账户来电无法接收
           - 企业 (AAD) 账户不受影响
           - 国内推送通道保持正常 (百度/小米/华为/OPPO/荣耀)
 
