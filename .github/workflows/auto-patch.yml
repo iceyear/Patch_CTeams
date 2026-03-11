@@ -32,23 +32,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zipalign apksigner axel
-          # Install apktool 3.0.1
-          APKTOOL_VERSION="3.0.1"
-          sudo wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -O /usr/local/bin/apktool.jar
-          sudo wget -q "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" -O /usr/local/bin/apktool
-          sudo chmod +x /usr/local/bin/apktool
-          apktool --version
-
       - name: Get last released version
         id: last_version
         run: |
@@ -83,6 +66,25 @@ jobs:
             echo "is_new=false" >> $GITHUB_OUTPUT
             echo "::notice::已是最新版本: $VERSION_NAME (code: $VERSION_CODE)"
           fi
+
+      - name: Setup Java
+        if: steps.check.outputs.is_new == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install dependencies
+        if: steps.check.outputs.is_new == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner axel
+          # Install apktool 3.0.1
+          APKTOOL_VERSION="3.0.1"
+          sudo wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -O /usr/local/bin/apktool.jar
+          sudo wget -q "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" -O /usr/local/bin/apktool
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
 
       - name: Download APK
         if: steps.check.outputs.is_new == 'true'
