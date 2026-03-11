@@ -22,9 +22,9 @@ on:
         type: boolean
         default: false
       fix_incoming_calls:
-        description: '修复个人账户来电接收'
+        description: '修复个人账户来电接收（测试）'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
