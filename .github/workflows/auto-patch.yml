@@ -21,6 +21,10 @@ on:
         description: '跳过初始化弹窗'
         type: boolean
         default: false
+      fix_incoming_calls:
+        description: '修复个人账户来电接收'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -69,16 +73,16 @@ jobs:
 
       - name: Setup Java
         if: steps.check.outputs.is_new == 'true'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
-          distribution: 'temurin'
+          distribution: 'liberica'
           java-version: '17'
 
       - name: Install dependencies
         if: steps.check.outputs.is_new == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zipalign apksigner aria2
+          sudo apt-get install -y zipalign apksigner aria2 axel
           # Install apktool 3.0.1
           APKTOOL_VERSION="3.0.1"
           sudo wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -O /usr/local/bin/apktool.jar
@@ -99,6 +103,7 @@ jobs:
           INPUT_APK=$(ls teams-china-*.apk | head -1)
           ARCH="${{ inputs.arch || 'arm64-v8a' }}"
           SKIP_DIALOGS="${{ inputs.skip_dialogs }}"
+          FIX_INCOMING_CALLS="${{ inputs.fix_incoming_calls || 'true' }}"
 
           PATCH_ARGS="$INPUT_APK"
           if [ "$ARCH" != "all" ]; then
@@ -106,6 +111,9 @@ jobs:
           fi
           if [ "$SKIP_DIALOGS" = "true" ]; then
             PATCH_ARGS="$PATCH_ARGS --skip-dialogs"
+          fi
+          if [ "$FIX_INCOMING_CALLS" = "true" ]; then
+            PATCH_ARGS="$PATCH_ARGS --fix-incoming-calls"
           fi
 
           # 解码外部签名密钥库 (如果配置了 secrets)
@@ -144,6 +152,7 @@ jobs:
           - ✅ 启用个人 (MSA/Consumer) 账户登录
           - ✅ 修复 redirect URI (签名变更适配)
           - ✅ 绕过 OneAuth redirect URI 校验
+          - ✅ 修复个人账户来电接收 (启用 Premature Notification Flow)
           - 企业 (AAD) 账户不受影响
           - 国内推送通道保持正常 (百度/小米/华为/OPPO/荣耀)
 
