@@ -78,7 +78,7 @@ jobs:
         if: steps.check.outputs.is_new == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zipalign apksigner axel
+          sudo apt-get install -y zipalign apksigner aria2
           # Install apktool 3.0.1
           APKTOOL_VERSION="3.0.1"
           sudo wget -q "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -O /usr/local/bin/apktool.jar
@@ -114,7 +114,7 @@ jobs:
             export KEYSTORE_FILE=/tmp/release-key.jks
           fi
 
-          export _JAVA_OPTIONS="-Xmx4g"
+          export _JAVA_OPTIONS="-Xmx6g"
           python3 patch_china_teams.py $PATCH_ARGS
           ls -lh *-patched*.apk
         env:
