@@ -70,12 +70,13 @@ def download_apk(download_url, output_dir, version_code):
     print(f"下载: {download_url}", file=sys.stderr)
 
     if shutil.which("axel"):
-        subprocess.run([
-            "axel", "-n", "8",
-            "-a",  # 显示进度条
-            "-o", tmp_filepath,
-            download_url,
-        ], check=True)
+        axel_args = ["axel", "-n", "8", "-o", tmp_filepath]
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+            axel_args.append("-q")  # CI 中静默，避免日志洪水
+        else:
+            axel_args.append("-a")  # 本地显示进度条
+        axel_args.append(download_url)
+        subprocess.run(axel_args, check=True)
     elif shutil.which("curl"):
         subprocess.run([
             "curl", "-L",
