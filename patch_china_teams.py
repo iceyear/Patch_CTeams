@@ -615,10 +615,11 @@ def patch_fix_incoming_calls(work_dir):
     else:
         uc_content = user_config_file.read_text(encoding="utf-8")
 
-        # 找到 enableTrouterRegistration 方法并在 .registers 行后插入 return true
+        # 找到 enableTrouterRegistration 方法并在 .registers/.locals 行后插入 return true
+        # 注意: JADX 输出 .registers，apktool 输出 .locals
         etr_pattern = re.compile(
             r'(\.method public final enableTrouterRegistration\(\)Z\s*'
-            r'\.registers \d+)\s*\n'
+            r'\.(?:registers|locals) \d+)\s*\n'
         )
 
         match = etr_pattern.search(uc_content)
