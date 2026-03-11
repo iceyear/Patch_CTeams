@@ -574,14 +574,20 @@ def patch_fix_incoming_calls(work_dir):
     """
     修复个人账户来电接收问题。
 
-    根因: CallManager 构造函数中 Premature Notification Flow 被强制禁用:
-        mPrematureNotificationFlowEnabled = ECS_setting && !isChinaPushTransport();
-    isChinaPushTransport() 在百度版中始终返回 true，导致该功能被禁用。
+    根因: CallManager 构造函数中 Premature Notification Flow 被禁用:
+        mPrematureNotificationFlowEnabled = getEcsSettingAsBoolean(
+            "PREMATURE_NOTIFICATION_FLOW_ENABLED", isDevDebug()
+        ) && !isChinaPushTransport();
+
+    双重限制:
+      1. ECS 设置在中国版服务端不存在，default = isDevDebug() = false
+      2. isChinaPushTransport() = isBaidu() = true，进一步强制禁用
+
     Premature Notification Flow 用于在 SkyLib 引擎初始化前提前显示来电通知。
     禁用后，服务端等待客户端响应超时 → 报告"用户不在线"。
 
-    修复: 将 isChinaPushTransport() 调用后的 move-result 覆盖为 const/4 vN, 0x0，
-    使后续 if-nez 条件永远不成立，从而保持 Premature Notification Flow 启用。
+    修复: 找到 iput-boolean vN, ..., mPrematureNotificationFlowEnabled:Z，
+    在其前插入 const/4 vN, 0x1 强制启用。
     """
     print("\n[*] Patch: 修复来电接收 (启用 Premature Notification Flow)")
 
@@ -596,84 +602,40 @@ def patch_fix_incoming_calls(work_dir):
 
     content = call_manager_file.read_text(encoding="utf-8")
 
-    # 提取 <init> 方法
-    init_pattern = re.compile(
-        r'(\.method public constructor <init>\(.*?\)V'
-        r'.*?'
-        r'\.end method)',
-        re.DOTALL,
-    )
-    init_match = init_pattern.search(content)
-    if not init_match:
-        # 也尝试匹配 synthetic 构造函数或其他变体
-        init_pattern = re.compile(
-            r'(\.method .*?<init>\(.*?\)V'
-            r'.*?'
-            r'\.end method)',
-            re.DOTALL,
-        )
-        init_match = init_pattern.search(content)
-
-    if not init_match:
-        print("  [ERROR] 未找到 CallManager.<init> 方法")
-        return 0
-
-    init_body = init_match.group(0)
-
-    # 匹配模式:
-    #   const-string vN, "PREMATURE_NOTIFICATION_FLOW_ENABLED"
-    #   ... (数行之间)
-    #   invoke-interface/range {pM .. pM}, L.../IAppConfiguration;->isChinaPushTransport()Z
-    #   \n
-    #       move-result vX
-    #   \n
-    #       if-nez vX, :cond_YYY
-    #
-    # 将 move-result vX 替换为 const/4 vX, 0x0
-
-    # 首先确认 PREMATURE_NOTIFICATION_FLOW_ENABLED 字符串存在于 init 中
-    if "PREMATURE_NOTIFICATION_FLOW_ENABLED" not in init_body:
-        print("  [ERROR] <init> 中未找到 PREMATURE_NOTIFICATION_FLOW_ENABLED")
-        return 0
-
-    # 匹配 isChinaPushTransport 调用 + move-result + if-nez 模式
-    # 在 <init> 方法中，靠近 mPrematureNotificationFlowEnabled 赋值的位置
-    patch_pattern = re.compile(
-        r'(invoke-interface(?:/range)? \{[^}]+\}, '
-        r'L[^;]+;->isChinaPushTransport\(\)Z'
-        r'\s*\n)'
-        r'(\s*move-result (v\d+))'
-        r'(\s*\n'
-        r'\s*if-nez v\d+, :\w+)'
+    # 找到 mPrematureNotificationFlowEnabled 的 iput-boolean 赋值
+    # smali 模式:
+    #   iput-boolean vN, vM, Lcom/.../CallManager;->mPrematureNotificationFlowEnabled:Z
+    iput_pattern = re.compile(
+        r'(    iput-boolean (v\d+), v\d+, '
+        r'Lcom/microsoft/skype/teams/calling/call/CallManager;'
+        r'->mPrematureNotificationFlowEnabled:Z)'
     )
 
-    match = patch_pattern.search(init_body)
+    match = iput_pattern.search(content)
     if not match:
-        print("  [ERROR] 未找到 isChinaPushTransport + move-result + if-nez 模式")
+        print("  [ERROR] 未找到 mPrematureNotificationFlowEnabled 赋值位置")
         return 0
 
-    reg = match.group(3)  # 寄存器名 (如 v0)
+    reg = match.group(2)  # 寄存器名 (如 v0)
+    full_line = match.group(1)
 
-    # 构建替换: 保留 invoke 调用 (避免副作用)，将 move-result 替换为 const/4
-    old_fragment = match.group(0)
-    new_fragment = (
-        match.group(1)
-        + f'\n    # [CHINA-PATCH] 强制 isChinaPushTransport = false，启用 Premature Notification Flow\n'
-        + f'    const/4 {reg}, 0x0'
-        + match.group(4)
+    # 在 iput-boolean 前插入 const/4 vN, 0x1 强制启用
+    inject = (
+        f'    # [CHINA-PATCH] 强制启用 Premature Notification Flow (来电接收修复)\n'
+        f'    const/4 {reg}, 0x1\n'
+        f'\n'
+        f'{full_line}'
     )
-
-    new_init_body = init_body.replace(old_fragment, new_fragment, 1)
-    if new_init_body == init_body:
+    new_content = content.replace(full_line, inject, 1)
+    if new_content == content:
         print("  [ERROR] 替换未生效")
         return 0
 
-    new_content = content.replace(init_body, new_init_body, 1)
     call_manager_file.write_text(new_content, encoding="utf-8")
 
-    print(f"  ✓ CallManager.<init>: isChinaPushTransport() → 强制 false")
+    print(f"  ✓ CallManager.<init>: mPrematureNotificationFlowEnabled = true")
     print(f"    寄存器: {reg}")
-    print(f"    效果: mPrematureNotificationFlowEnabled 将由 ECS 设置决定 (不再被中国版强制禁用)")
+    print(f"    效果: 来电通知将在 SkyLib 初始化前立即显示")
     print(f"    文件: {call_manager_file.relative_to(work_dir)}")
     return 1
 
