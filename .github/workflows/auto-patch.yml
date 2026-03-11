@@ -103,7 +103,7 @@ jobs:
           INPUT_APK=$(ls teams-china-*.apk | head -1)
           ARCH="${{ inputs.arch || 'arm64-v8a' }}"
           SKIP_DIALOGS="${{ inputs.skip_dialogs }}"
-          FIX_INCOMING_CALLS="${{ inputs.fix_incoming_calls || 'true' }}"
+          FIX_INCOMING_CALLS="${{ inputs.fix_incoming_calls || 'false' }}"
 
           PATCH_ARGS="$INPUT_APK"
           if [ "$ARCH" != "all" ]; then
