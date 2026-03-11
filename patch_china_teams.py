@@ -102,6 +102,7 @@ def patch_enable_consumer_tenant(work_dir):
     修改点:
     1. AppConfigurationImpl.enableConsumerTenant() → 始终返回 true
     2. AuthAppConfiguration.<init> → enableConsumerTenant 字段始终为 true
+    3. AppConfigurationImpl.shouldShowSignUpButton() → 移除 isBaidu 限制
     """
     print("\n[2/5] Patch: 启用 Consumer Tenant (个人账户)")
 
@@ -206,9 +207,65 @@ def patch_enable_consumer_tenant(work_dir):
     else:
         print("  [WARN] 未找到 AuthAppConfiguration.smali")
 
-    # === Patch 3: UserConfiguration 中可能存在的 enableConsumerTenant 相关检查 ===
-    # UserConfiguration 通过 IAppConfiguration.enableConsumerTenant() 间接获取，
-    # 已由 Patch 1 覆盖，理论上不需要额外修改
+    # === Patch 3: AppConfigurationImpl.shouldShowSignUpButton() ===
+    #
+    # 原始逻辑:
+    #   if (isKingston() || isRealWear() || isPanel()) return false;
+    #   if (isBaidu()) return false;            ← 百度版本限制
+    #   if (disableTflTenant) return false;
+    #   return true;
+    #
+    # smali 模式:
+    #   invoke-static {}, ...AppBuildConfigurationHelper;->isBaidu()Z
+    #   move-result v2
+    #   if-nez v2, :cond_XX   ← 跳转到 return false
+    #
+    # 目标: 移除 isBaidu() 导致的条件跳转，允许百度版本显示注册按钮
+    #       当登录遇到错误时，用户可以通过注册按钮进行恢复
+
+    if app_config_file and app_config_file.exists():
+        content = app_config_file.read_text(encoding="utf-8")
+
+        # 找到 shouldShowSignUpButton 方法
+        method_pattern = re.compile(
+            r'\.method public final shouldShowSignUpButton\(\)Z'
+            r'(.*?)'
+            r'\.end method',
+            re.DOTALL
+        )
+        method_match = method_pattern.search(content)
+        if method_match:
+            method_body = method_match.group(0)
+            # 在方法体内找到 isBaidu()Z 后的 if-nez 条件跳转
+            baidu_pattern = re.compile(
+                r'(invoke-static \{}, L[^;]*AppBuildConfigurationHelper;->isBaidu\(\)Z'
+                r'\s*\n\s*move-result (v\d+)\s*\n)'
+                r'(\s*if-nez v\d+, :\w+)'
+            )
+            baidu_match = baidu_pattern.search(method_body)
+            if baidu_match:
+                old_fragment = baidu_match.group(0)
+                # 保留 invoke 和 move-result，将 if-nez 替换为 smali 注释
+                new_fragment = (
+                    baidu_match.group(1)
+                    + '\n    # [CHINA-PATCH] 移除 isBaidu 限制，允许显示注册按钮'
+                )
+                new_method = method_body.replace(old_fragment, new_fragment, 1)
+                new_content = content.replace(method_body, new_method, 1)
+                if new_content != content:
+                    app_config_file.write_text(new_content, encoding="utf-8")
+                    patch_count += 1
+                    print(f"  ✓ AppConfigurationImpl.shouldShowSignUpButton() → 移除 isBaidu 限制")
+                    print(f"    文件: {app_config_file.relative_to(work_dir)}")
+                else:
+                    print("  [WARN] shouldShowSignUpButton: 替换未生效")
+            else:
+                print("  [WARN] shouldShowSignUpButton 方法中未找到 isBaidu 条件跳转")
+        else:
+            print("  [WARN] 未找到 shouldShowSignUpButton 方法")
+
+    # 注: UserConfiguration 通过 IAppConfiguration.enableConsumerTenant() 间接获取，
+    # 已由 Patch 1 覆盖，不需要额外修改
 
     if patch_count == 0:
         print("  [ERROR] 未能成功应用任何 Consumer Tenant patch!")
