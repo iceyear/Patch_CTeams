@@ -29,7 +29,7 @@ KEYSTORE_FILE = os.environ.get("KEYSTORE_FILE") or "china-patch-key.jks"
 KEYSTORE_PASS = os.environ.get("KEYSTORE_PASS") or "chinapatch123"
 KEY_ALIAS = os.environ.get("KEY_ALIAS") or "chinapatch"
 KEY_PASS = os.environ.get("KEY_PASS") or KEYSTORE_PASS
-JAVA_HEAP_SIZE = "4g"
+JAVA_HEAP_SIZE = "6g"
 
 
 def run_cmd(cmd, check=True, capture=False, java_heap=False):
@@ -570,6 +570,114 @@ def patch_auto_skip_dialogs(work_dir):
     return patch_count
 
 
+def patch_fix_incoming_calls(work_dir):
+    """
+    修复个人账户来电接收问题。
+
+    根因: CallManager 构造函数中 Premature Notification Flow 被强制禁用:
+        mPrematureNotificationFlowEnabled = ECS_setting && !isChinaPushTransport();
+    isChinaPushTransport() 在百度版中始终返回 true，导致该功能被禁用。
+    Premature Notification Flow 用于在 SkyLib 引擎初始化前提前显示来电通知。
+    禁用后，服务端等待客户端响应超时 → 报告"用户不在线"。
+
+    修复: 将 isChinaPushTransport() 调用后的 move-result 覆盖为 const/4 vN, 0x0，
+    使后续 if-nez 条件永远不成立，从而保持 Premature Notification Flow 启用。
+    """
+    print("\n[*] Patch: 修复来电接收 (启用 Premature Notification Flow)")
+
+    call_manager_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/calling/call/CallManager"
+    )
+
+    if not call_manager_file:
+        print("  [ERROR] 未找到 CallManager.smali")
+        return 0
+
+    content = call_manager_file.read_text(encoding="utf-8")
+
+    # 提取 <init> 方法
+    init_pattern = re.compile(
+        r'(\.method public constructor <init>\(.*?\)V'
+        r'.*?'
+        r'\.end method)',
+        re.DOTALL,
+    )
+    init_match = init_pattern.search(content)
+    if not init_match:
+        # 也尝试匹配 synthetic 构造函数或其他变体
+        init_pattern = re.compile(
+            r'(\.method .*?<init>\(.*?\)V'
+            r'.*?'
+            r'\.end method)',
+            re.DOTALL,
+        )
+        init_match = init_pattern.search(content)
+
+    if not init_match:
+        print("  [ERROR] 未找到 CallManager.<init> 方法")
+        return 0
+
+    init_body = init_match.group(0)
+
+    # 匹配模式:
+    #   const-string vN, "PREMATURE_NOTIFICATION_FLOW_ENABLED"
+    #   ... (数行之间)
+    #   invoke-interface/range {pM .. pM}, L.../IAppConfiguration;->isChinaPushTransport()Z
+    #   \n
+    #       move-result vX
+    #   \n
+    #       if-nez vX, :cond_YYY
+    #
+    # 将 move-result vX 替换为 const/4 vX, 0x0
+
+    # 首先确认 PREMATURE_NOTIFICATION_FLOW_ENABLED 字符串存在于 init 中
+    if "PREMATURE_NOTIFICATION_FLOW_ENABLED" not in init_body:
+        print("  [ERROR] <init> 中未找到 PREMATURE_NOTIFICATION_FLOW_ENABLED")
+        return 0
+
+    # 匹配 isChinaPushTransport 调用 + move-result + if-nez 模式
+    # 在 <init> 方法中，靠近 mPrematureNotificationFlowEnabled 赋值的位置
+    patch_pattern = re.compile(
+        r'(invoke-interface(?:/range)? \{[^}]+\}, '
+        r'L[^;]+;->isChinaPushTransport\(\)Z'
+        r'\s*\n)'
+        r'(\s*move-result (v\d+))'
+        r'(\s*\n'
+        r'\s*if-nez v\d+, :\w+)'
+    )
+
+    match = patch_pattern.search(init_body)
+    if not match:
+        print("  [ERROR] 未找到 isChinaPushTransport + move-result + if-nez 模式")
+        return 0
+
+    reg = match.group(3)  # 寄存器名 (如 v0)
+
+    # 构建替换: 保留 invoke 调用 (避免副作用)，将 move-result 替换为 const/4
+    old_fragment = match.group(0)
+    new_fragment = (
+        match.group(1)
+        + f'\n    # [CHINA-PATCH] 强制 isChinaPushTransport = false，启用 Premature Notification Flow\n'
+        + f'    const/4 {reg}, 0x0'
+        + match.group(4)
+    )
+
+    new_init_body = init_body.replace(old_fragment, new_fragment, 1)
+    if new_init_body == init_body:
+        print("  [ERROR] 替换未生效")
+        return 0
+
+    new_content = content.replace(init_body, new_init_body, 1)
+    call_manager_file.write_text(new_content, encoding="utf-8")
+
+    print(f"  ✓ CallManager.<init>: isChinaPushTransport() → 强制 false")
+    print(f"    寄存器: {reg}")
+    print(f"    效果: mPrematureNotificationFlowEnabled 将由 ECS 设置决定 (不再被中国版强制禁用)")
+    print(f"    文件: {call_manager_file.relative_to(work_dir)}")
+    return 1
+
+
 def rebuild_apk(work_dir, output_apk):
     """使用 apktool 重新构建 APK"""
     print(f"\n[3/5] 重新构建 APK")
@@ -724,6 +832,7 @@ def main():
     python3 patch_china_teams.py teams-china.apk
     python3 patch_china_teams.py teams-china.apk --output teams-patched.apk
     python3 patch_china_teams.py teams-china.apk --skip-dialogs
+    python3 patch_china_teams.py teams-china.apk --fix-incoming-calls
     python3 patch_china_teams.py teams-china.apk --arch arm64-v8a
         """,
     )
@@ -733,6 +842,8 @@ def main():
                         help="同时跳过隐私同意/诊断数据/联系人同步弹窗")
     parser.add_argument("--arch", default=None,
                         help="仅保留指定架构的原生库 (如 arm64-v8a)，移除其他架构以减小 APK 体积")
+    parser.add_argument("--fix-incoming-calls", action="store_true",
+                        help="修复个人账户来电接收 (启用 Premature Notification Flow)")
     parser.add_argument("--keep-work-dir", action="store_true",
                         help="保留反编译工作目录")
 
@@ -757,6 +868,7 @@ def main():
     print(f"输入: {input_apk}")
     print(f"输出: {output_apk}")
     print(f"跳过弹窗: {'是' if args.skip_dialogs else '否'}")
+    print(f"修复来电: {'是' if args.fix_incoming_calls else '否'}")
     print(f"架构裁剪: {args.arch if args.arch else '否 (保留全部)'}")
 
     has_apksigner = check_dependencies()
@@ -779,7 +891,11 @@ def main():
         if args.skip_dialogs:
             patch_auto_skip_dialogs(work_dir)
 
-        # Step 2d: 可选 — 裁剪架构
+        # Step 2d: 可选 — 修复来电接收
+        if args.fix_incoming_calls:
+            patch_fix_incoming_calls(work_dir)
+
+        # Step 2e: 可选 — 裁剪架构
         if args.arch:
             print(f"\n[*] 裁剪原生库架构: 仅保留 {args.arch}")
             strip_architectures(work_dir, args.arch)
