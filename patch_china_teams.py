@@ -574,22 +574,79 @@ def patch_fix_incoming_calls(work_dir):
     """
     修复个人账户来电接收问题。
 
-    根因: CallManager 构造函数中 Premature Notification Flow 被禁用:
-        mPrematureNotificationFlowEnabled = getEcsSettingAsBoolean(
-            "PREMATURE_NOTIFICATION_FLOW_ENABLED", isDevDebug()
-        ) && !isChinaPushTransport();
+    根因分析（三重阻断）:
 
-    双重限制:
-      1. ECS 设置在中国版服务端不存在，default = isDevDebug() = false
-      2. isChinaPushTransport() = isBaidu() = true，进一步强制禁用
+    1. enableTrouterRegistration() 返回 false（主要原因）:
+       UserConfiguration.enableTrouterRegistration() 依赖 ECS 设置 "trouterEnabled"
+       (默认 false)。当返回 false 时:
+       - SkyLibManager.registerTrouter() 不注册 TeamsTrouterListener（来电 Trouter 监听器）
+       - CallingTrouter 永远不连接，来电信号无法通过 Trouter 送达
+       - CallManager 将 SkyLib 切换为 NAL_QUIET_SUSPENDED_OFFLINE_LEVEL（离线模式）
+       - 服务端看到设备离线，报告"用户不在线"
 
-    Premature Notification Flow 用于在 SkyLib 引擎初始化前提前显示来电通知。
-    禁用后，服务端等待客户端响应超时 → 报告"用户不在线"。
+    2. TflRegistrarHelper 仅注册 MESSAGING 上下文:
+       TflRegistrarHelper.getTransportRegistrationArrayForPoll() 硬编码只返回
+       "MESSAGING" 上下文，忽略 calling 相关上下文。
+       （此问题在启用 Trouter 注册后由 TeamsTrouterListener 自己的 EDF 注册路径绕过）
 
-    修复: 找到 iput-boolean vN, ..., mPrematureNotificationFlowEnabled:Z，
-    在其前插入 const/4 vN, 0x1 强制启用。
+    3. Premature Notification Flow 被禁用（次要原因）:
+       CallManager.<init> 中 mPrematureNotificationFlowEnabled 依赖不存在的 ECS
+       设置且被 isChinaPushTransport() 进一步强制禁用。此流程用于在 SkyLib 初始化
+       前提前显示来电通知（应用在后台时冷启动场景）。
+
+    修复方案:
+    - Patch 1: enableTrouterRegistration() 强制返回 true → 启用 Calling Trouter
+    - Patch 2: mPrematureNotificationFlowEnabled 强制为 true → 启用推送来电流程
     """
-    print("\n[*] Patch: 修复来电接收 (启用 Premature Notification Flow)")
+    print("\n[*] Patch: 修复来电接收")
+    patch_count = 0
+
+    # === Patch 1: UserConfiguration.enableTrouterRegistration() → true ===
+    # 关键修复: 使 SkyLibManager 注册 TeamsTrouterListener，保持 SkyLib 在线
+    print("\n  --- Patch 1: 启用 Calling Trouter 注册 ---")
+
+    user_config_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/configuration/UserConfiguration"
+    )
+
+    if not user_config_file:
+        print("  [ERROR] 未找到 UserConfiguration.smali")
+    else:
+        uc_content = user_config_file.read_text(encoding="utf-8")
+
+        # 找到 enableTrouterRegistration 方法并在 .registers 行后插入 return true
+        etr_pattern = re.compile(
+            r'(\.method public final enableTrouterRegistration\(\)Z\s*'
+            r'\.registers \d+)\s*\n'
+        )
+
+        match = etr_pattern.search(uc_content)
+        if not match:
+            print("  [ERROR] 未找到 enableTrouterRegistration 方法")
+        else:
+            inject = (
+                f'{match.group(1)}\n'
+                f'\n'
+                f'    # [CHINA-PATCH] 强制启用 Trouter 注册 (来电接收核心修复)\n'
+                f'    const/4 v0, 0x1\n'
+                f'\n'
+                f'    return v0\n'
+                f'\n'
+            )
+            new_uc = uc_content.replace(match.group(0), inject, 1)
+            if new_uc != uc_content:
+                user_config_file.write_text(new_uc, encoding="utf-8")
+                print(f"  ✓ UserConfiguration.enableTrouterRegistration() → true")
+                print(f"    效果: TeamsTrouterListener 将注册，SkyLib 保持在线模式")
+                print(f"    文件: {user_config_file.relative_to(work_dir)}")
+                patch_count += 1
+            else:
+                print("  [ERROR] enableTrouterRegistration 替换未生效")
+
+    # === Patch 2: mPrematureNotificationFlowEnabled = true ===
+    # 辅助修复: 应用在后台时通过推送来电通知唤醒
+    print("\n  --- Patch 2: 启用 Premature Notification Flow ---")
 
     call_manager_file = find_smali_file(
         work_dir,
@@ -598,46 +655,40 @@ def patch_fix_incoming_calls(work_dir):
 
     if not call_manager_file:
         print("  [ERROR] 未找到 CallManager.smali")
-        return 0
+    else:
+        cm_content = call_manager_file.read_text(encoding="utf-8")
 
-    content = call_manager_file.read_text(encoding="utf-8")
+        # 找到 mPrematureNotificationFlowEnabled 的 iput-boolean 赋值
+        iput_pattern = re.compile(
+            r'(    iput-boolean (v\d+), v\d+, '
+            r'Lcom/microsoft/skype/teams/calling/call/CallManager;'
+            r'->mPrematureNotificationFlowEnabled:Z)'
+        )
 
-    # 找到 mPrematureNotificationFlowEnabled 的 iput-boolean 赋值
-    # smali 模式:
-    #   iput-boolean vN, vM, Lcom/.../CallManager;->mPrematureNotificationFlowEnabled:Z
-    iput_pattern = re.compile(
-        r'(    iput-boolean (v\d+), v\d+, '
-        r'Lcom/microsoft/skype/teams/calling/call/CallManager;'
-        r'->mPrematureNotificationFlowEnabled:Z)'
-    )
+        match = iput_pattern.search(cm_content)
+        if not match:
+            print("  [ERROR] 未找到 mPrematureNotificationFlowEnabled 赋值位置")
+        else:
+            reg = match.group(2)
+            full_line = match.group(1)
 
-    match = iput_pattern.search(content)
-    if not match:
-        print("  [ERROR] 未找到 mPrematureNotificationFlowEnabled 赋值位置")
-        return 0
+            inject = (
+                f'    # [CHINA-PATCH] 强制启用 Premature Notification Flow\n'
+                f'    const/4 {reg}, 0x1\n'
+                f'\n'
+                f'{full_line}'
+            )
+            new_cm = cm_content.replace(full_line, inject, 1)
+            if new_cm != cm_content:
+                call_manager_file.write_text(new_cm, encoding="utf-8")
+                print(f"  ✓ CallManager.<init>: mPrematureNotificationFlowEnabled = true")
+                print(f"    效果: 来电通知将在 SkyLib 初始化前立即显示")
+                print(f"    文件: {call_manager_file.relative_to(work_dir)}")
+                patch_count += 1
+            else:
+                print("  [ERROR] mPrematureNotificationFlowEnabled 替换未生效")
 
-    reg = match.group(2)  # 寄存器名 (如 v0)
-    full_line = match.group(1)
-
-    # 在 iput-boolean 前插入 const/4 vN, 0x1 强制启用
-    inject = (
-        f'    # [CHINA-PATCH] 强制启用 Premature Notification Flow (来电接收修复)\n'
-        f'    const/4 {reg}, 0x1\n'
-        f'\n'
-        f'{full_line}'
-    )
-    new_content = content.replace(full_line, inject, 1)
-    if new_content == content:
-        print("  [ERROR] 替换未生效")
-        return 0
-
-    call_manager_file.write_text(new_content, encoding="utf-8")
-
-    print(f"  ✓ CallManager.<init>: mPrematureNotificationFlowEnabled = true")
-    print(f"    寄存器: {reg}")
-    print(f"    效果: 来电通知将在 SkyLib 初始化前立即显示")
-    print(f"    文件: {call_manager_file.relative_to(work_dir)}")
-    return 1
+    return patch_count
 
 
 def rebuild_apk(work_dir, output_apk):
