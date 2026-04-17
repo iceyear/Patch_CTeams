@@ -103,6 +103,11 @@ def patch_enable_consumer_tenant(work_dir):
     1. AppConfigurationImpl.enableConsumerTenant() → 始终返回 true
     2. AuthAppConfiguration.<init> → enableConsumerTenant 字段始终为 true
     3. AppConfigurationImpl.shouldShowSignUpButton() → 移除 isBaidu 限制
+    4. AuthorizationService.addConsumerTenantIfNecessary() → 忽略 consumerMTBlocked
+
+    兼容新版变化:
+    - 新版 AppConfigurationImpl.enableConsumerTenant() 额外受 ECS 开关
+      "disableConsumerSignIn" 控制；直接替换整个方法体可一并绕过。
     """
     print("\n[2/5] Patch: 启用 Consumer Tenant (个人账户)")
 
@@ -266,6 +271,44 @@ def patch_enable_consumer_tenant(work_dir):
 
     # 注: UserConfiguration 通过 IAppConfiguration.enableConsumerTenant() 间接获取，
     # 已由 Patch 1 覆盖，不需要额外修改
+
+    # === Patch 4: AuthorizationService.addConsumerTenantIfNecessary() ===
+    #
+    # 新版若服务端返回 AuthenticatedUser.consumerMTBlocked=true，
+    # 即使 enableConsumerTenant 已打开，也不会把 Consumer tenant
+    # 加入租户列表，最终表现为“没有组织/没有租户可选”。
+    #
+    # 目标: 忽略 consumerMTBlocked，缺少 consumer tenant 时始终补入。
+
+    authz_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/authorization/AuthorizationService"
+    )
+
+    if authz_file:
+        content = authz_file.read_text(encoding="utf-8")
+        blocked_pattern = re.compile(
+            r'(    iget-boolean p3, p2, '
+            r'Lcom/microsoft/skype/teams/models/AuthenticatedUser;'
+            r'->consumerMTBlocked:Z)'
+        )
+        match = blocked_pattern.search(content)
+        if match:
+            full_line = match.group(1)
+            inject = (
+                '    # [CHINA-PATCH] 忽略 consumerMTBlocked，强制补入 consumer tenant\n'
+                '    const/4 p3, 0x0'
+            )
+            new_content = content.replace(full_line, inject, 1)
+            if new_content != content:
+                authz_file.write_text(new_content, encoding="utf-8")
+                patch_count += 1
+                print("  ✓ AuthorizationService.addConsumerTenantIfNecessary() → 忽略 consumerMTBlocked")
+                print(f"    文件: {authz_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] AuthorizationService: 未找到 consumerMTBlocked 检查")
+    else:
+        print("  [WARN] 未找到 AuthorizationService.smali")
 
     if patch_count == 0:
         print("  [ERROR] 未能成功应用任何 Consumer Tenant patch!")
@@ -574,7 +617,7 @@ def patch_fix_incoming_calls(work_dir):
     """
     修复个人账户来电接收问题。
 
-    根因分析（三重阻断）:
+    根因分析（七重阻断）:
 
     1. enableTrouterRegistration() 返回 false（主要原因）:
        UserConfiguration.enableTrouterRegistration() 依赖 ECS 设置 "trouterEnabled"
@@ -584,19 +627,47 @@ def patch_fix_incoming_calls(work_dir):
        - CallManager 将 SkyLib 切换为 NAL_QUIET_SUSPENDED_OFFLINE_LEVEL（离线模式）
        - 服务端看到设备离线，报告"用户不在线"
 
-    2. TflRegistrarHelper 仅注册 MESSAGING 上下文:
-       TflRegistrarHelper.getTransportRegistrationArrayForPoll() 硬编码只返回
-       "MESSAGING" 上下文，忽略 calling 相关上下文。
-       （此问题在启用 Trouter 注册后由 TeamsTrouterListener 自己的 EDF 注册路径绕过）
+    2. TeamsTrouterListener 未写入 TrouterAndroidTeams 的 push routing path:
+       官方 TFL 路径会把 TrouterAndroidTeams 归入 PushNotification，再由
+       TflRegistrarHelper.getTransportRegistrationArrayForPush() 生成 "TFL" 上下文。
+       但 TeamsTrouterListener 自己只保存 routingPath 并直接排队 EDF 注册，没有把
+       TrouterAndroidTeams 路径写入 LongPollSyncHelper.mNotificationTypeRoutingPathMap。
 
-    3. Premature Notification Flow 被禁用（次要原因）:
+    3. TflRegistrarHelper 仅注册 MESSAGING 上下文:
+       TflRegistrarHelper.getTransportRegistrationArrayForPoll() 硬编码只返回
+       "MESSAGING" 上下文。若 TrouterAndroidTeams 路径没有进入 PushNotification，
+       那么 TROUTER transport 最终只剩消息相关上下文。
+
+    4. Notification filter 去重导致 TeamsTrouterListener 注册被跳过:
+       LongPollSyncHelper.registerNotificationFilterForRegistrationId() 会对通知过滤设置做
+       diff-hash 去重，命中后直接返回 "REGISTRATION_SKIPPED"。实测日志里 TeamsTrouterListener
+       会长期卡在这一步，即使前面的 Trouter 连接和 EDF body 构造已经完成。
+
+    5. China push transport 构建分支仍在生效:
+       即使前面的 calling 注册已经打通，AppConfigurationImpl.isChinaPushTransport() 仍然
+       因 isBaidu() 返回 true。calling/longpoll/notification 相关代码仍会走 China build
+       专属分支，和全球版 TFL calling 行为不一致。
+
+    6. Skype endpoint 被 ECS 强制走 message poll 分支:
+       LongPollSyncHelper 在 PNHEndpointType.Skype 下会读取 ECS
+       "skypeMessagePollEnabled"。当其为 true 时，TFL 的 TROUTER 注册会走
+       getTransportRegistrationArrayForPoll()，最终只上报消息上下文；
+       当其为 false 时，才会走 getTransportRegistrationArrayForPush()，使用 TFL
+       push 语义。当前日志中 Skype endpoint 一直被拉去走 poll 分支。
+
+    7. Premature Notification Flow 被禁用（次要原因）:
        CallManager.<init> 中 mPrematureNotificationFlowEnabled 依赖不存在的 ECS
        设置且被 isChinaPushTransport() 进一步强制禁用。此流程用于在 SkyLib 初始化
        前提前显示来电通知（应用在后台时冷启动场景）。
 
     修复方案:
     - Patch 1: enableTrouterRegistration() 强制返回 true → 启用 Calling Trouter
-    - Patch 2: mPrematureNotificationFlowEnabled 强制为 true → 启用推送来电流程
+    - Patch 2: TeamsTrouterListener 写入/移除 PushNotification routing path
+    - Patch 3: TflRegistrarHelper 复用传入的 context map → 至少保留现有 Trouter contexts
+    - Patch 4: 关闭 notification filter 的重复设置短路 → 避免 REGISTRATION_SKIPPED
+    - Patch 5: isChinaPushTransport() 强制返回 false → 走全球 TFL calling 分支
+    - Patch 6: Skype endpoint 强制走 push/TFL 分支，而非 message poll
+    - Patch 7: mPrematureNotificationFlowEnabled 强制为 true → 启用推送来电流程
     """
     print("\n[*] Patch: 修复来电接收")
     patch_count = 0
@@ -645,9 +716,382 @@ def patch_fix_incoming_calls(work_dir):
             else:
                 print("  [ERROR] enableTrouterRegistration 替换未生效")
 
-    # === Patch 2: mPrematureNotificationFlowEnabled = true ===
+    # === Patch 2: TeamsTrouterListener 写入 PushNotification routing path ===
+    # 关键修复: TFL 的 TrouterAndroidTeams 路径需要进入 PushNotification，
+    # 这样 TROUTER transport 才会生成官方使用的 TFL push context。
+    print("\n  --- Patch 2: 写入 TrouterAndroidTeams push routing path ---")
+
+    teams_trouter_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/calling/notification/TeamsTrouterListener"
+    )
+
+    if not teams_trouter_file:
+        print("  [ERROR] 未找到 TeamsTrouterListener.smali")
+    else:
+        tt_content = teams_trouter_file.read_text(encoding="utf-8")
+
+        connected_anchor = (
+            '    iput-object p1, p0, '
+            'Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mRoutingPath:Ljava/lang/String;\n'
+        )
+        connected_inject = (
+            '    iput-object p1, p0, '
+            'Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mRoutingPath:Ljava/lang/String;\n'
+            '\n'
+            '    # [CHINA-PATCH] 将 TrouterAndroidTeams 路径写入 PushNotification map\n'
+            '    if-eqz p1, :cond_china_patch_push_done\n'
+            '\n'
+            '    iget-object v3, p0, Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mLongPollSyncHelper:'
+            'Lcom/microsoft/skype/teams/services/longpoll/LongPollSyncHelper;\n'
+            '\n'
+            '    iget-object v3, v3, Lcom/microsoft/skype/teams/services/longpoll/'
+            'LongPollSyncHelper;->mNotificationTypeRoutingPathMap:'
+            'Ljava/util/concurrent/ConcurrentHashMap;\n'
+            '\n'
+            '    const-string v4, "PushNotification"\n'
+            '\n'
+            '    invoke-virtual {v3, v4, p1}, Ljava/util/concurrent/ConcurrentHashMap;'
+            '->put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\n'
+            '\n'
+            '    :cond_china_patch_push_done\n'
+        )
+
+        disconnected_anchor = (
+            '    iput-wide v2, p0, '
+            'Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mEdfRegistrationTime:J\n'
+        )
+        disconnected_inject = (
+            '    iput-wide v2, p0, '
+            'Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mEdfRegistrationTime:J\n'
+            '\n'
+            '    # [CHINA-PATCH] 清理 TrouterAndroidTeams push routing path\n'
+            '    iget-object v0, p0, Lcom/microsoft/skype/teams/calling/notification/'
+            'TeamsTrouterListener;->mLongPollSyncHelper:'
+            'Lcom/microsoft/skype/teams/services/longpoll/LongPollSyncHelper;\n'
+            '\n'
+            '    iget-object v0, v0, Lcom/microsoft/skype/teams/services/longpoll/'
+            'LongPollSyncHelper;->mNotificationTypeRoutingPathMap:'
+            'Ljava/util/concurrent/ConcurrentHashMap;\n'
+            '\n'
+            '    const-string v3, "PushNotification"\n'
+            '\n'
+            '    invoke-virtual {v0, v3}, Ljava/util/concurrent/ConcurrentHashMap;'
+            '->remove(Ljava/lang/Object;)Ljava/lang/Object;\n'
+        )
+
+        new_tt = tt_content
+        if connected_anchor in new_tt:
+            new_tt = new_tt.replace(connected_anchor, connected_inject, 1)
+        else:
+            print("  [ERROR] TeamsTrouterListener.onTrouterConnected 注入点未找到")
+
+        if disconnected_anchor in new_tt:
+            new_tt = new_tt.replace(disconnected_anchor, disconnected_inject, 1)
+        else:
+            print("  [ERROR] TeamsTrouterListener.onTrouterDisconnected 注入点未找到")
+
+        if new_tt != tt_content:
+            teams_trouter_file.write_text(new_tt, encoding="utf-8")
+            print("  ✓ TeamsTrouterListener → 写入/移除 PushNotification routing path")
+            print("    效果: TROUTER transport 可生成官方 TFL push context，而不只剩消息上下文")
+            print(f"    文件: {teams_trouter_file.relative_to(work_dir)}")
+            patch_count += 1
+
+    # === Patch 3: TflRegistrarHelper.getTransportRegistrationArrayForPoll() ===
+    # 关键修复: TFL 账户的 EDF 注册不能只上报 MESSAGING，还必须保留 calling 上下文
+    print("\n  --- Patch 3: 修复 TFL EDF 上下文注册 ---")
+
+    tfl_registrar_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/longpoll/TflRegistrarHelper"
+    )
+
+    if not tfl_registrar_file:
+        print("  [ERROR] 未找到 TflRegistrarHelper.smali")
+    else:
+        tr_content = tfl_registrar_file.read_text(encoding="utf-8")
+
+        method_pattern = (
+            r'(\.method public final getTransportRegistrationArrayForPoll'
+            r'\(Ljava/lang/String;ILjava/util/Map;'
+            r'Lcom/microsoft/teams/core/services/configuration/IUserConfiguration;\)'
+            r'\[Lcom/microsoft/skype/teams/data/'
+            r'RegistrationNotificationClientSettings\$EdfRegistrationEntry;)'
+            r'.*?'
+            r'(\.end method)'
+        )
+        method_replacement = (
+            r'\1\n'
+            '    .locals 6\n'
+            '\n'
+            '    # [CHINA-PATCH] TFL 账户保留所有 Trouter contexts，避免只注册 MESSAGING\n'
+            '    if-eqz p3, :fallback\n'
+            '\n'
+            '    invoke-interface {p3}, Ljava/util/Map;->isEmpty()Z\n'
+            '\n'
+            '    move-result v0\n'
+            '\n'
+            '    if-nez v0, :fallback\n'
+            '\n'
+            '    invoke-interface {p3}, Ljava/util/Map;->entrySet()Ljava/util/Set;\n'
+            '\n'
+            '    move-result-object v0\n'
+            '\n'
+            '    invoke-interface {v0}, Ljava/util/Set;->size()I\n'
+            '\n'
+            '    move-result v1\n'
+            '\n'
+            '    new-array v1, v1, [Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;\n'
+            '\n'
+            '    invoke-interface {v0}, Ljava/util/Set;->iterator()Ljava/util/Iterator;\n'
+            '\n'
+            '    move-result-object v0\n'
+            '\n'
+            '    const/4 v2, 0x0\n'
+            '\n'
+            '    :loop_contexts\n'
+            '    invoke-interface {v0}, Ljava/util/Iterator;->hasNext()Z\n'
+            '\n'
+            '    move-result v3\n'
+            '\n'
+            '    if-eqz v3, :return_contexts\n'
+            '\n'
+            '    invoke-interface {v0}, Ljava/util/Iterator;->next()Ljava/lang/Object;\n'
+            '\n'
+            '    move-result-object v3\n'
+            '\n'
+            '    check-cast v3, Ljava/util/Map$Entry;\n'
+            '\n'
+            '    new-instance v4, Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;\n'
+            '\n'
+            '    invoke-interface {v3}, Ljava/util/Map$Entry;->getKey()Ljava/lang/Object;\n'
+            '\n'
+            '    move-result-object v5\n'
+            '\n'
+            '    check-cast v5, Ljava/lang/String;\n'
+            '\n'
+            '    invoke-interface {v3}, Ljava/util/Map$Entry;->getValue()Ljava/lang/Object;\n'
+            '\n'
+            '    move-result-object v3\n'
+            '\n'
+            '    check-cast v3, Ljava/lang/String;\n'
+            '\n'
+            '    invoke-direct {v4, v5, v3, p2}, Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;-><init>'
+            '(Ljava/lang/String;Ljava/lang/String;I)V\n'
+            '\n'
+            '    aput-object v4, v1, v2\n'
+            '\n'
+            '    add-int/lit8 v2, v2, 0x1\n'
+            '\n'
+            '    goto :loop_contexts\n'
+            '\n'
+            '    :return_contexts\n'
+            '    return-object v1\n'
+            '\n'
+            '    :fallback\n'
+            '    const/4 v0, 0x1\n'
+            '\n'
+            '    new-array v0, v0, [Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;\n'
+            '\n'
+            '    new-instance v1, Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;\n'
+            '\n'
+            '    const-string v2, "MESSAGING"\n'
+            '\n'
+            '    invoke-direct {v1, v2, p1, p2}, Lcom/microsoft/skype/teams/data/'
+            'RegistrationNotificationClientSettings$EdfRegistrationEntry;-><init>'
+            '(Ljava/lang/String;Ljava/lang/String;I)V\n'
+            '\n'
+            '    const/4 v2, 0x0\n'
+            '\n'
+            '    aput-object v1, v0, v2\n'
+            '\n'
+            '    return-object v0\n'
+            r'\2'
+        )
+
+        new_tr = re.sub(method_pattern, method_replacement, tr_content, count=1, flags=re.DOTALL)
+        if new_tr != tr_content:
+            tfl_registrar_file.write_text(new_tr, encoding="utf-8")
+            print("  ✓ TflRegistrarHelper.getTransportRegistrationArrayForPoll() → 保留全部 contexts")
+            print("    效果: EDF 注册不再硬编码为 [MESSAGING]，可上报 CALLINGEVENTS 等上下文")
+            print(f"    文件: {tfl_registrar_file.relative_to(work_dir)}")
+            patch_count += 1
+        else:
+            print("  [ERROR] 未找到 TflRegistrarHelper.getTransportRegistrationArrayForPoll 方法")
+
+    # === Patch 4: 关闭 EDF / notification filter duplicate skip ===
+    # 日志显示 TeamsTrouterListener 经常在 registerNotificationFilter 阶段被
+    # "Skip registration for duplicate ..." 短路掉，最终报 REGISTRATION_SKIPPED。
+    print("\n  --- Patch 4: 禁用 duplicate skip 短路 ---")
+
+    longpoll_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/longpoll/LongPollSyncHelper"
+    )
+
+    if not longpoll_file:
+        print("  [ERROR] 未找到 LongPollSyncHelper.smali")
+    else:
+        lp_content = longpoll_file.read_text(encoding="utf-8")
+
+        dup_skip_pattern = re.compile(
+            r'(invoke-virtual \{v13, v11, v14, v7, v0\}, '
+            r'Lcom/microsoft/skype/teams/services/longpoll/LongPollSyncHelper;'
+            r'->notificationSettingDupCheck'
+            r'\(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\)Z\n'
+            r'\n'
+            r'    move-result v7\n'
+            r'\n)'
+            r'    if-eqz v7, :cond_2d'
+        )
+
+        new_lp = dup_skip_pattern.sub(
+            r'\1'
+            '    # [CHINA-PATCH] 始终继续注册 notification filter，避免 TeamsTrouterListener 卡在 REGISTRATION_SKIPPED\n'
+            '    goto :cond_2d',
+            lp_content,
+            count=1,
+        )
+
+        if new_lp != lp_content:
+            longpoll_file.write_text(new_lp, encoding="utf-8")
+            print("  ✓ LongPollSyncHelper.registerNotificationFilterForRegistrationId() → 禁用 duplicate skip")
+            print("    效果: calling listener 不再因重复设置被短路为 REGISTRATION_SKIPPED")
+            print(f"    文件: {longpoll_file.relative_to(work_dir)}")
+            patch_count += 1
+        else:
+            print("  [WARN] 未找到 LongPollSyncHelper 内的 duplicate filter 短路点")
+
+    # LongPollSyncHelper.createEdfRegistration() 的 duplicate notification skip
+    # 位于一个独立的 lambda 类中，需要单独 patch。
+    lambda15_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/longpoll/LongPollSyncHelper$$ExternalSyntheticLambda15"
+    )
+
+    if not lambda15_file:
+        print("  [WARN] 未找到 LongPollSyncHelper$$ExternalSyntheticLambda15.smali")
+    else:
+        l15_content = lambda15_file.read_text(encoding="utf-8")
+        dup_notification_pattern = re.compile(
+            r'(invoke-virtual \{v10, v12, v8, v0, v1\}, '
+            r'Lcom/microsoft/skype/teams/services/longpoll/LongPollSyncHelper;'
+            r'->notificationSettingDupCheck'
+            r'\(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\)Z\n'
+            r'\n'
+            r'    move-result v0\n'
+            r'\n)'
+            r'    if-eqz v0, :cond_8'
+        )
+        new_l15 = dup_notification_pattern.sub(
+            r'\1'
+            '    # [CHINA-PATCH] 始终继续 createEdfRegistration，避免 duplicate notification setting 导致 REGISTRATION_SKIPPED\n'
+            '    goto :cond_8',
+            l15_content,
+            count=1,
+        )
+        if new_l15 != l15_content:
+            lambda15_file.write_text(new_l15, encoding="utf-8")
+            print("  ✓ LongPollSyncHelper$$ExternalSyntheticLambda15 → 禁用 duplicate notification skip")
+            print("    效果: createEdfRegistration 不再因 duplicate notification setting 直接返回 RegistrationSkipped")
+            print(f"    文件: {lambda15_file.relative_to(work_dir)}")
+            patch_count += 1
+        else:
+            print("  [WARN] 未找到 lambda15 内的 duplicate notification 短路点")
+
+    # === Patch 5: AppConfigurationImpl.isChinaPushTransport() = false ===
+    # 让 calling/longpoll 相关代码不再继续走 Baidu 的 China push transport 分支。
+    print("\n  --- Patch 5: 关闭 China push transport calling 分支 ---")
+
+    app_config_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/configuration/AppConfigurationImpl"
+    )
+
+    if not app_config_file:
+        print("  [ERROR] 未找到 AppConfigurationImpl.smali")
+    else:
+        ac_content = app_config_file.read_text(encoding="utf-8")
+        china_transport_pattern = (
+            r'(\.method public final isChinaPushTransport\(\)Z)'
+            r'.*?'
+            r'(\.end method)'
+        )
+        china_transport_replacement = (
+            r'\1\n'
+            '    .locals 1\n'
+            '\n'
+            '    # [CHINA-PATCH] calling 相关路径按全球版处理，不再视为 China push transport\n'
+            '    const/4 v0, 0x0\n'
+            '\n'
+            '    return v0\n'
+            r'\2'
+        )
+        new_ac = re.sub(
+            china_transport_pattern,
+            china_transport_replacement,
+            ac_content,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if new_ac != ac_content:
+            app_config_file.write_text(new_ac, encoding="utf-8")
+            print("  ✓ AppConfigurationImpl.isChinaPushTransport() → false")
+            print("    效果: calling / longpoll 不再沿用 Baidu China push transport 分支")
+            print(f"    文件: {app_config_file.relative_to(work_dir)}")
+            patch_count += 1
+        else:
+            print("  [WARN] 未找到 isChinaPushTransport 方法")
+
+    # === Patch 6: Skype endpoint 强制走 push/TFL 分支 ===
+    # 避免 skypeMessagePollEnabled=true 时把 Skype endpoint 拉去只注册 MESSAGING。
+    print("\n  --- Patch 6: 强制 Skype endpoint 走 TFL push 分支 ---")
+
+    if not longpoll_file:
+        print("  [ERROR] 未找到 LongPollSyncHelper.smali")
+    else:
+        lp_content = longpoll_file.read_text(encoding="utf-8")
+        skype_poll_pattern = re.compile(
+            r'(const-string/jumbo v4, "skypeMessagePollEnabled"\n'
+            r'\n'
+            r'    invoke-interface \{v12, v4\}, '
+            r'Lcom/microsoft/teams/nativecore/INativeCoreExperimentationManager;'
+            r'->getEcsSettingAsBoolean\(Ljava/lang/String;\)Z\n'
+            r'\n'
+            r'    move-result v4\n'
+            r'\n)'
+            r'    if-eqz v4, :cond_17'
+        )
+        new_lp = skype_poll_pattern.sub(
+            r'\1'
+            '    # [CHINA-PATCH] 无论 ECS 如何，Skype endpoint 都走 push/TFL 分支\n'
+            '    goto :cond_17',
+            lp_content,
+            count=1,
+        )
+        if new_lp != lp_content:
+            longpoll_file.write_text(new_lp, encoding="utf-8")
+            print("  ✓ LongPollSyncHelper → Skype endpoint 强制走 push/TFL 分支")
+            print("    效果: Skype endpoint 的 TROUTER context 不再被 ECS 拉回仅 MESSAGING")
+            print(f"    文件: {longpoll_file.relative_to(work_dir)}")
+            patch_count += 1
+        else:
+            print("  [WARN] 未找到 skypeMessagePollEnabled 分支")
+
+    # === Patch 7: mPrematureNotificationFlowEnabled = true ===
     # 辅助修复: 应用在后台时通过推送来电通知唤醒
-    print("\n  --- Patch 2: 启用 Premature Notification Flow ---")
+    print("\n  --- Patch 7: 启用 Premature Notification Flow ---")
 
     call_manager_file = find_smali_file(
         work_dir,
@@ -857,7 +1301,7 @@ def main():
     parser.add_argument("--arch", default=None,
                         help="仅保留指定架构的原生库 (如 arm64-v8a)，移除其他架构以减小 APK 体积")
     parser.add_argument("--fix-incoming-calls", action="store_true",
-                        help="修复个人账户来电接收 (启用 Premature Notification Flow)")
+                        help="修复个人账户来电接收 (启用 Calling Trouter/TFL EDF/Premature Flow)")
     parser.add_argument("--keep-work-dir", action="store_true",
                         help="保留反编译工作目录")
 
