@@ -592,6 +592,17 @@ def patch_tfl_post_login_chain(work_dir):
                 '    # [CHINA-PATCH] get SSO accounts task 未完成时不再强制回 FreAuth\n'
                 '    :goto_2'
             ),
+            (
+                '    invoke-interface {v2, v4, v5, p1, v1}, Lcom/microsoft/teams/nativecore/logger/ILogger;->log(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V\n'
+                '\n'
+                '    invoke-virtual {v0, v6, v7, v8, v9}, Lcom/microsoft/skype/teams/services/navigation/TeamsNavigationService;->navigateToFreAuth(Landroid/content/Context;Lcom/microsoft/skype/teams/models/pojos/FreParameters;ZI)V\n'
+                '\n'
+                '    goto :goto_2',
+                '    invoke-interface {v2, v4, v5, p1, v1}, Lcom/microsoft/teams/nativecore/logger/ILogger;->log(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V\n'
+                '\n'
+                '    # [CHINA-PATCH] SSO emails 为空时保持当前流程，不再强制跳回 FreAuth\n'
+                '    goto :goto_2'
+            ),
         ]
         updated = False
         for old, new in lambda_patterns:
@@ -630,12 +641,29 @@ def patch_tfl_post_login_chain(work_dir):
             count=1,
         )
         if new_freauth != freauth_content:
+            freauth_content = new_freauth
             freauth_file.write_text(new_freauth, encoding="utf-8")
             patch_count += 1
             print("  ✓ FreAuthActivity → 忽略 signOut resetUser 分支")
             print(f"    文件: {freauth_file.relative_to(work_dir)}")
         else:
             print("  [WARN] FreAuthActivity: 未找到 signOut resetUser 分支")
+
+        reset_calls_pattern = re.compile(
+            r'(^\s*)invoke-interface \{[vp]\d+\}, '
+            r'Lcom/microsoft/skype/teams/services/authorization/IAuthorizationService;'
+            r'->resetUser\(\)V',
+            flags=re.MULTILINE,
+        )
+        new_freauth = reset_calls_pattern.sub(
+            r'\1# [CHINA-PATCH] 禁用 FreAuthActivity 内部 resetUser，避免跳回首页\n\1nop',
+            freauth_content,
+        )
+        if new_freauth != freauth_content:
+            freauth_file.write_text(new_freauth, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ FreAuthActivity → 禁用剩余 resetUser 调用")
+            print(f"    文件: {freauth_file.relative_to(work_dir)}")
     else:
         print("  [WARN] 未找到 FreAuthActivity.smali")
 
