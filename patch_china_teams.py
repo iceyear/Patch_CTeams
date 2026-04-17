@@ -104,6 +104,7 @@ def patch_enable_consumer_tenant(work_dir):
     2. AuthAppConfiguration.<init> → enableConsumerTenant 字段始终为 true
     3. AppConfigurationImpl.shouldShowSignUpButton() → 移除 isBaidu 限制
     4. AuthorizationService.addConsumerTenantIfNecessary() → 忽略 consumerMTBlocked
+    5. AuthorizationService.createConsumerTenant() → 固定使用 "个人" 文案
 
     兼容新版变化:
     - 新版 AppConfigurationImpl.enableConsumerTenant() 额外受 ECS 开关
@@ -307,6 +308,26 @@ def patch_enable_consumer_tenant(work_dir):
                 print(f"    文件: {authz_file.relative_to(work_dir)}")
         else:
             print("  [WARN] AuthorizationService: 未找到 consumerMTBlocked 检查")
+
+        rename_pattern = re.compile(
+            r'(    if-eqz p2, :cond_0)'
+        )
+        rename_match = rename_pattern.search(content)
+        if rename_match:
+            old_line = rename_match.group(1)
+            new_line = (
+                '    # [CHINA-PATCH] 固定使用 consumer_tenant_name，避免显示个人昵称为组织名\n'
+                '    goto :cond_0'
+            )
+            new_content = content.replace(old_line, new_line, 1)
+            if new_content != content:
+                authz_file.write_text(new_content, encoding="utf-8")
+                content = new_content
+                patch_count += 1
+                print("  ✓ AuthorizationService.createConsumerTenant() → 固定使用默认 consumer 名称")
+                print(f"    文件: {authz_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] AuthorizationService: 未找到 createConsumerTenant 重命名分支")
     else:
         print("  [WARN] 未找到 AuthorizationService.smali")
 
@@ -316,6 +337,165 @@ def patch_enable_consumer_tenant(work_dir):
     else:
         print(f"\n  总计成功应用 {patch_count} 处 Consumer Tenant patch")
 
+    return patch_count
+
+
+def patch_tfl_post_login_chain(work_dir):
+    """
+    修复新版登录后的 TFL 请求链路。
+
+    目标:
+    1. TflRequestInterceptor 遇到 token/auth 异常时 fail-open，避免直接把用户踢回登录页
+    2. IntegrityChallengeInterceptor 不再触发新版完整性挑战逻辑
+    3. TeamsLicenseRepository 不再主动发起 license 刷新，并始终视作已有 Teams license
+    """
+    print("\n[*] Patch: 修复 TFL 登录后链路")
+    patch_count = 0
+
+    # === Patch 1: TflRequestInterceptor.throwAuthError() ===
+    tfl_interceptor_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/data/proxy/TflRequestInterceptor"
+    )
+
+    if not tfl_interceptor_file:
+        print("  [ERROR] 未找到 TflRequestInterceptor.smali")
+    else:
+        content = tfl_interceptor_file.read_text(encoding="utf-8")
+        pattern = (
+            r'(\.method public static throwAuthError'
+            r'\(Lcom/microsoft/skype/teams/data/BaseException;'
+            r'Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;\)V)'
+            r'.*?'
+            r'(\.end method)'
+        )
+        replacement = (
+            r'\1\n'
+            '    .locals 0\n'
+            '\n'
+            '    # [CHINA-PATCH] TFL 后续接口失败时 fail-open，避免直接回到登录首页\n'
+            '    return-void\n'
+            r'\2'
+        )
+        new_content = re.sub(pattern, replacement, content, count=1, flags=re.DOTALL)
+        if new_content != content:
+            tfl_interceptor_file.write_text(new_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ TflRequestInterceptor.throwAuthError() → fail-open")
+            print(f"    文件: {tfl_interceptor_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] TflRequestInterceptor: 未找到 throwAuthError 方法")
+
+    # === Patch 2: IntegrityChallengeInterceptor.intercept() ===
+    integrity_file = find_smali_file(
+        work_dir,
+        "com/microsoft/teams/appintegrity/IntegrityChallengeInterceptor"
+    )
+
+    if not integrity_file:
+        print("  [ERROR] 未找到 IntegrityChallengeInterceptor.smali")
+    else:
+        content = integrity_file.read_text(encoding="utf-8")
+        pattern = (
+            r'(\.method public final intercept'
+            r'\(Lokhttp3/Interceptor\$Chain;\)Lokhttp3/Response;)'
+            r'.*?'
+            r'(\.end method)'
+        )
+        replacement = (
+            r'\1\n'
+            '    .locals 1\n'
+            '\n'
+            '    const-string v0, "chain"\n'
+            '\n'
+            '    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V\n'
+            '\n'
+            '    invoke-interface {p1}, Lokhttp3/Interceptor$Chain;->request()Lokhttp3/Request;\n'
+            '\n'
+            '    move-result-object v0\n'
+            '\n'
+            '    invoke-interface {p1, v0}, Lokhttp3/Interceptor$Chain;->proceed(Lokhttp3/Request;)Lokhttp3/Response;\n'
+            '\n'
+            '    move-result-object v0\n'
+            '\n'
+            '    return-object v0\n'
+            r'\2'
+        )
+        new_content = re.sub(pattern, replacement, content, count=1, flags=re.DOTALL)
+        if new_content != content:
+            integrity_file.write_text(new_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ IntegrityChallengeInterceptor.intercept() → 跳过完整性挑战")
+            print(f"    文件: {integrity_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] IntegrityChallengeInterceptor: 未找到 intercept 方法")
+
+    # === Patch 3/4/5: TeamsLicenseRepository ===
+    license_repo_file = find_smali_file(
+        work_dir,
+        "com/microsoft/teams/license/TeamsLicenseRepository"
+    )
+
+    if not license_repo_file:
+        print("  [ERROR] 未找到 TeamsLicenseRepository.smali")
+    else:
+        content = license_repo_file.read_text(encoding="utf-8")
+
+        patterns = [
+            (
+                r'(\.method public final getProbablyHasTeamsLicense\(\)Z)'
+                r'.*?'
+                r'(\.end method)',
+                r'\1\n'
+                '    .locals 1\n'
+                '\n'
+                '    const/4 v0, 0x1\n'
+                '\n'
+                '    return v0\n'
+                r'\2',
+                "getProbablyHasTeamsLicense"
+            ),
+            (
+                r'(\.method public final requestRefreshLicenseDetails\(Z\)V)'
+                r'.*?'
+                r'(\.end method)',
+                r'\1\n'
+                '    .locals 0\n'
+                '\n'
+                '    return-void\n'
+                r'\2',
+                "requestRefreshLicenseDetails(Z)"
+            ),
+            (
+                r'(\.method public final requestRefreshLicenseDetails'
+                r'\(JLkotlin/coroutines/jvm/internal/ContinuationImpl;\)'
+                r'Ljava/lang/Object;)'
+                r'.*?'
+                r'(\.end method)',
+                r'\1\n'
+                '    .locals 1\n'
+                '\n'
+                '    sget-object v0, Lkotlin/Unit;->INSTANCE:Lkotlin/Unit;\n'
+                '\n'
+                '    return-object v0\n'
+                r'\2',
+                "requestRefreshLicenseDetails(J, Continuation)"
+            ),
+        ]
+
+        for pattern, replacement, label in patterns:
+            new_content = re.sub(pattern, replacement, content, count=1, flags=re.DOTALL)
+            if new_content != content:
+                content = new_content
+                patch_count += 1
+                print(f"  ✓ TeamsLicenseRepository.{label} 已 patch")
+            else:
+                print(f"  [WARN] TeamsLicenseRepository: 未找到 {label}")
+
+        license_repo_file.write_text(content, encoding="utf-8")
+        print(f"    文件: {license_repo_file.relative_to(work_dir)}")
+
+    print(f"\n  TFL 登录后链路: 成功 {patch_count} 处")
     return patch_count
 
 
@@ -1345,15 +1525,18 @@ def main():
         # Step 2b: Patch redirect URI (签名变更后必须)
         patch_redirect_uri(work_dir)
 
-        # Step 2c: 可选 — 跳过弹窗
+        # Step 2c: Patch TFL 登录后链路 (新版完整性/License 问题)
+        patch_tfl_post_login_chain(work_dir)
+
+        # Step 2d: 可选 — 跳过弹窗
         if args.skip_dialogs:
             patch_auto_skip_dialogs(work_dir)
 
-        # Step 2d: 可选 — 修复来电接收
+        # Step 2e: 可选 — 修复来电接收
         if args.fix_incoming_calls:
             patch_fix_incoming_calls(work_dir)
 
-        # Step 2e: 可选 — 裁剪架构
+        # Step 2f: 可选 — 裁剪架构
         if args.arch:
             print(f"\n[*] 裁剪原生库架构: 仅保留 {args.arch}")
             strip_architectures(work_dir, args.arch)
