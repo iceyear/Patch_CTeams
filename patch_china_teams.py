@@ -350,6 +350,8 @@ def patch_tfl_post_login_chain(work_dir):
     3. TeamsLicenseRepository 不再主动发起 license 刷新，并始终视作已有 Teams license
     4. TeamsNavigationService 不再因 SSO emails 为空强制跳回 FreAuth
     5. FreAuthActivity 忽略 signOut/resetUser 分支，避免再次回首页
+    6. GetPrimaryResourceTokenAction 不再因为 NO_HOME_TENANT 报错
+    7. Fre4vActivity 在空页场景下点击“开始使用”不再崩溃
     """
     print("\n[*] Patch: 修复 TFL 登录后链路")
     patch_count = 0
@@ -666,6 +668,99 @@ def patch_tfl_post_login_chain(work_dir):
             print(f"    文件: {freauth_file.relative_to(work_dir)}")
     else:
         print("  [WARN] 未找到 FreAuthActivity.smali")
+
+    # === Patch 8: GetPrimaryResourceTokenAction 忽略 NO_HOME_TENANT ===
+    gpta_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/authorization/actions/GetPrimaryResourceTokenAction"
+    )
+
+    if gpta_file:
+        gpta_content = gpta_file.read_text(encoding="utf-8")
+        no_home_tenant_old = (
+            '    if-eqz v0, :cond_1\n'
+        )
+        no_home_tenant_new = (
+            '    # [CHINA-PATCH] 忽略 NO_HOME_TENANT，继续按已有 token 成功路径处理\n'
+            '    goto :cond_1\n'
+        )
+        if no_home_tenant_old in gpta_content:
+            gpta_content = gpta_content.replace(no_home_tenant_old, no_home_tenant_new, 1)
+            gpta_file.write_text(gpta_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ GetPrimaryResourceTokenAction → 忽略 NO_HOME_TENANT")
+            print(f"    文件: {gpta_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] GetPrimaryResourceTokenAction: 未找到 NO_HOME_TENANT 分支")
+
+        no_home_tenant_idhrd_old = (
+            '    :cond_4\n'
+            '    :goto_0\n'
+        )
+        no_home_tenant_idhrd_new = (
+            '    :cond_4\n'
+            '    # [CHINA-PATCH] 个人账户场景下忽略 idHRD 分支里的 NO_HOME_TENANT\n'
+            '    goto :cond_3\n'
+            '\n'
+            '    :goto_0\n'
+        )
+        if no_home_tenant_idhrd_old in gpta_content:
+            gpta_content = gpta_content.replace(no_home_tenant_idhrd_old, no_home_tenant_idhrd_new, 1)
+            gpta_file.write_text(gpta_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ GetPrimaryResourceTokenAction(idHRD) → 忽略 NO_HOME_TENANT")
+            print(f"    文件: {gpta_file.relative_to(work_dir)}")
+    else:
+        print("  [WARN] 未找到 GetPrimaryResourceTokenAction.smali")
+
+    # === Patch 9: Fre4vActivity 空页保护 ===
+    fre4v_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/views/activities/Fre4vActivity"
+    )
+
+    if fre4v_file:
+        fre4v_content = fre4v_file.read_text(encoding="utf-8")
+        guard_anchor = (
+            '    if-nez v0, :cond_0\n'
+            '\n'
+            '    return-void\n'
+            '\n'
+            '    :cond_0\n'
+            '    iget-boolean v1, p0, Lcom/microsoft/skype/teams/views/activities/Fre4vActivity;->mIsCurrentVerticalTFL:Z\n'
+        )
+        guard_replacement = (
+            '    if-nez v0, :cond_0\n'
+            '\n'
+            '    return-void\n'
+            '\n'
+            '    :cond_0\n'
+            '    iget-object v1, v0, Lcom/microsoft/skype/teams/views/adapters/viewpagers/FreAdapter;->mFragments:Ljava/util/ArrayList;\n'
+            '\n'
+            '    invoke-virtual {v1}, Ljava/util/ArrayList;->isEmpty()Z\n'
+            '\n'
+            '    move-result v1\n'
+            '\n'
+            '    if-eqz v1, :cond_china_patch_fre4v_continue\n'
+            '\n'
+            '    # [CHINA-PATCH] 空页场景下点击开始使用直接切到后续视图，避免 getItem 越界崩溃\n'
+            '    invoke-virtual {p0}, Lcom/microsoft/skype/teams/views/activities/Fre4vActivity;->showActionCardsViewPager()V\n'
+            '\n'
+            '    return-void\n'
+            '\n'
+            '    :cond_china_patch_fre4v_continue\n'
+            '    iget-boolean v1, p0, Lcom/microsoft/skype/teams/views/activities/Fre4vActivity;->mIsCurrentVerticalTFL:Z\n'
+        )
+        if guard_anchor in fre4v_content:
+            fre4v_content = fre4v_content.replace(guard_anchor, guard_replacement, 1)
+            fre4v_file.write_text(fre4v_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ Fre4vActivity.onActionButtonClicked() → 空页保护")
+            print(f"    文件: {fre4v_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] Fre4vActivity: 未找到空页保护注入点")
+    else:
+        print("  [WARN] 未找到 Fre4vActivity.smali")
 
     print(f"\n  TFL 登录后链路: 成功 {patch_count} 处")
     return patch_count
