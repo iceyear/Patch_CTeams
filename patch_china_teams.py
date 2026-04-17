@@ -348,6 +348,8 @@ def patch_tfl_post_login_chain(work_dir):
     1. TflRequestInterceptor 遇到 token/auth 异常时 fail-open，避免直接把用户踢回登录页
     2. IntegrityChallengeInterceptor 不再触发新版完整性挑战逻辑
     3. TeamsLicenseRepository 不再主动发起 license 刷新，并始终视作已有 Teams license
+    4. TeamsNavigationService 不再因 SSO emails 为空强制跳回 FreAuth
+    5. FreAuthActivity 忽略 signOut/resetUser 分支，避免再次回首页
     """
     print("\n[*] Patch: 修复 TFL 登录后链路")
     patch_count = 0
@@ -494,6 +496,148 @@ def patch_tfl_post_login_chain(work_dir):
 
         license_repo_file.write_text(content, encoding="utf-8")
         print(f"    文件: {license_repo_file.relative_to(work_dir)}")
+
+        print(f"\n  TFL 登录后链路: 成功 {patch_count} 处")
+    # === Patch 6: TeamsNavigationService 导航回退链 ===
+    nav_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/navigation/TeamsNavigationService"
+    )
+    nav_lambda_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/services/navigation/TeamsNavigationService$$ExternalSyntheticLambda35"
+    )
+
+    if nav_file:
+        nav_content = nav_file.read_text(encoding="utf-8")
+        nav_method_pattern = (
+            r'(\.method public final navigateToFreAuth'
+            r'\(Landroid/content/Context;Lcom/microsoft/skype/teams/models/pojos/FreParameters;ZI\)V)'
+            r'.*?'
+            r'(\.end method)'
+        )
+        nav_method_replacement = (
+            r'\1\n'
+            '    .locals 1\n'
+            '\n'
+            '    invoke-static {p2}, Lcom/microsoft/teams/utils/NavigationMappersKt;->toFreAuthParamsGeneratorBuilder(Lcom/microsoft/skype/teams/models/pojos/FreParameters;)Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;\n'
+            '\n'
+            '    move-result-object p2\n'
+            '\n'
+            '    # [CHINA-PATCH] 跳回 FreAuth 时不再带 signOut 语义\n'
+            '    const/4 v0, 0x0\n'
+            '\n'
+            '    iput-boolean v0, p2, Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;->signOut:Z\n'
+            '\n'
+            '    if-eqz p3, :cond_0\n'
+            '\n'
+            '    const/4 p3, 0x1\n'
+            '\n'
+            '    iput-boolean p3, p2, Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;->bringToFront:Z\n'
+            '\n'
+            '    new-instance p3, Lcom/microsoft/skype/teams/keys/IntentKey$FreAuthActivityIntentKey;\n'
+            '\n'
+            '    invoke-virtual {p2}, Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;->build()Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator;\n'
+            '\n'
+            '    move-result-object p2\n'
+            '\n'
+            '    invoke-direct {p3, p2}, Lcom/microsoft/skype/teams/keys/IntentKey$FreAuthActivityIntentKey;-><init>(Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator;)V\n'
+            '\n'
+            '    invoke-virtual {p0, p1, p3}, Lcom/microsoft/skype/teams/services/navigation/TeamsNavigationService;->navigateWithIntentKey(Landroid/content/Context;Lcom/microsoft/skype/teams/keys/BaseIntentKey;)Lbolts/Task;\n'
+            '\n'
+            '    goto :goto_0\n'
+            '\n'
+            '    :cond_0\n'
+            '    iput p4, p2, Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;->flags:I\n'
+            '\n'
+            '    new-instance p3, Lcom/microsoft/skype/teams/keys/IntentKey$FreAuthActivityIntentKey;\n'
+            '\n'
+            '    invoke-virtual {p2}, Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator$Builder;->build()Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator;\n'
+            '\n'
+            '    move-result-object p2\n'
+            '\n'
+            '    invoke-direct {p3, p2}, Lcom/microsoft/skype/teams/keys/IntentKey$FreAuthActivityIntentKey;-><init>(Lcom/microsoft/skype/teams/activity/FreAuthParamsGenerator;)V\n'
+            '\n'
+            '    invoke-virtual {p0, p1, p3}, Lcom/microsoft/skype/teams/services/navigation/TeamsNavigationService;->navigateWithIntentKey(Landroid/content/Context;Lcom/microsoft/skype/teams/keys/BaseIntentKey;)Lbolts/Task;\n'
+            '\n'
+            '    :goto_0\n'
+            '    return-void\n'
+            r'\2'
+        )
+        new_nav_content = re.sub(nav_method_pattern, nav_method_replacement, nav_content, count=1, flags=re.DOTALL)
+        if new_nav_content != nav_content:
+            nav_file.write_text(new_nav_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ TeamsNavigationService.navigateToFreAuth() → 清除 signOut 参数")
+            print(f"    文件: {nav_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] TeamsNavigationService: 未找到 navigateToFreAuth 方法")
+    else:
+        print("  [WARN] 未找到 TeamsNavigationService.smali")
+
+    if nav_lambda_file:
+        lambda_content = nav_lambda_file.read_text(encoding="utf-8")
+        lambda_patterns = [
+            (
+                '    invoke-virtual {v0, v6, v7, v8, v9}, Lcom/microsoft/skype/teams/services/navigation/TeamsNavigationService;->navigateToFreAuth(Landroid/content/Context;Lcom/microsoft/skype/teams/models/pojos/FreParameters;ZI)V\n'
+                '\n'
+                '    goto :goto_2',
+                '    # [CHINA-PATCH] SSO emails 为空时保持当前流程，不再强制跳回 FreAuth\n'
+                '    goto :goto_2'
+            ),
+            (
+                '    invoke-virtual {v0, v6, v7, v8, v9}, Lcom/microsoft/skype/teams/services/navigation/TeamsNavigationService;->navigateToFreAuth(Landroid/content/Context;Lcom/microsoft/skype/teams/models/pojos/FreParameters;ZI)V\n'
+                '\n'
+                '    :goto_2',
+                '    # [CHINA-PATCH] get SSO accounts task 未完成时不再强制回 FreAuth\n'
+                '    :goto_2'
+            ),
+        ]
+        updated = False
+        for old, new in lambda_patterns:
+            if old in lambda_content:
+                lambda_content = lambda_content.replace(old, new, 1)
+                updated = True
+        if updated:
+            nav_lambda_file.write_text(lambda_content, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ TeamsNavigationService$$ExternalSyntheticLambda35 → 禁止 SSO fallback 跳回 FreAuth")
+            print(f"    文件: {nav_lambda_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] TeamsNavigationService$$ExternalSyntheticLambda35: 未找到 SSO fallback 跳转点")
+    else:
+        print("  [WARN] 未找到 TeamsNavigationService$$ExternalSyntheticLambda35.smali")
+
+    # === Patch 7: FreAuthActivity 忽略 signOut resetUser 分支 ===
+    freauth_file = find_smali_file(
+        work_dir,
+        "com/microsoft/skype/teams/views/activities/FreAuthActivity"
+    )
+
+    if freauth_file:
+        freauth_content = freauth_file.read_text(encoding="utf-8")
+        signout_pattern = re.compile(
+            r'(    iget-boolean v2, v5, '
+            r'Lcom/microsoft/skype/teams/models/pojos/FreParameters;->signOut:Z\n)'
+            r'(\n\s*if-eqz v2, :cond_3c)'
+        )
+        new_freauth = signout_pattern.sub(
+            r'\1'
+            '    # [CHINA-PATCH] 忽略 signOut/resetUser 分支，避免再次回首页\n'
+            '    const/4 v2, 0x0\n'
+            r'\2',
+            freauth_content,
+            count=1,
+        )
+        if new_freauth != freauth_content:
+            freauth_file.write_text(new_freauth, encoding="utf-8")
+            patch_count += 1
+            print("  ✓ FreAuthActivity → 忽略 signOut resetUser 分支")
+            print(f"    文件: {freauth_file.relative_to(work_dir)}")
+        else:
+            print("  [WARN] FreAuthActivity: 未找到 signOut resetUser 分支")
+    else:
+        print("  [WARN] 未找到 FreAuthActivity.smali")
 
     print(f"\n  TFL 登录后链路: 成功 {patch_count} 处")
     return patch_count
